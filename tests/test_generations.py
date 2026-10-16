@@ -1026,3 +1026,113 @@ def test_publish_migrates_an_older_pointer_without_reading_it(tmp_path: Path) ->
         "pointer_schema_version": "carddav-current/1.1",
         "synced_at": "2026-09-10T01:00:00Z",
     }
+
+
+def _publish_distinct(
+    generations: ModuleType,
+    profile_dir: Path,
+    profile: dict[str, object],
+    profile_bytes: bytes,
+    names: list[str],
+    **kwargs: object,
+) -> list[str]:
+    """Publish one generation per display name, each stamped strictly newer than the last."""
+    card_path = profile_dir / "runtime" / "mirror" / "contacts-a" / "one.vcf"
+    published: list[str] = []
+    for offset, name in enumerate(names):
+        card_path.write_text(_card("one", name), encoding="utf-8")
+        card_path.chmod(0o600)
+        generation = generations.publish(profile_dir, profile, profile_bytes, **kwargs)
+        stamp = SYNCED_AT_EPOCH + offset * 60
+        os.utime(profile_dir / "generations" / generation, ns=(stamp * 10**9, stamp * 10**9))
+        published.append(generation)
+    return published
+
+
+def test_publish_retains_only_the_newest_generations(tmp_path: Path) -> None:
+    generations = _load("generations")
+    profile_dir, profile, profile_bytes = _profile_dir(
+        tmp_path, {"one.vcf": _card("one", "Example One")}
+    )
+
+    published = _publish_distinct(
+        generations, profile_dir, profile, profile_bytes,
+        ["Example One", "Example Two", "Example Three", "Example Four", "Example Five"],
+    )
+
+    assert generations.RETAINED_GENERATIONS == 3
+    kept = sorted(path.name for path in (profile_dir / "generations").iterdir())
+    assert kept == sorted(published[-3:])
+    assert generations.read_current(profile_dir, profile_bytes) == published[-1]
+    _assert_private(profile_dir / "generations")
+
+
+def test_retention_limit_is_a_publish_parameter(tmp_path: Path) -> None:
+    generations = _load("generations")
+    profile_dir, profile, profile_bytes = _profile_dir(
+        tmp_path, {"one.vcf": _card("one", "Example One")}
+    )
+
+    published = _publish_distinct(
+        generations, profile_dir, profile, profile_bytes,
+        ["Example One", "Example Two", "Example Three"], retain=1,
+    )
+
+    assert [path.name for path in (profile_dir / "generations").iterdir()] == [published[-1]]
+
+
+def test_the_current_generation_is_never_pruned_even_when_it_is_the_oldest(
+    tmp_path: Path,
+) -> None:
+    generations = _load("generations")
+    profile_dir, profile, profile_bytes = _profile_dir(
+        tmp_path, {"one.vcf": _card("one", "Example One")}
+    )
+    published = _publish_distinct(
+        generations, profile_dir, profile, profile_bytes,
+        ["Example One", "Example Two", "Example Three"],
+    )
+    # Remote content reverts to the first state: the reused, oldest-stamped
+    # generation becomes current again and must survive while newer ones go.
+    card_path = profile_dir / "runtime" / "mirror" / "contacts-a" / "one.vcf"
+    card_path.write_text(_card("one", "Example One"), encoding="utf-8")
+
+    assert generations.publish(profile_dir, profile, profile_bytes, retain=2) == published[0]
+
+    kept = sorted(path.name for path in (profile_dir / "generations").iterdir())
+    assert kept == sorted([published[0], published[2]])
+    assert generations.read_current(profile_dir, profile_bytes) == published[0]
+
+
+def test_pruning_leaves_entries_that_are_not_generations_alone(tmp_path: Path) -> None:
+    generations = _load("generations")
+    profile_dir, profile, profile_bytes = _profile_dir(
+        tmp_path, {"one.vcf": _card("one", "Example One")}
+    )
+    generations.publish(profile_dir, profile, profile_bytes)
+    stranger = profile_dir / "generations" / "not-a-generation"
+    stranger.mkdir(mode=0o700)
+    (stranger / "note").write_bytes(b"left alone")
+    (stranger / "note").chmod(0o600)
+
+    published = _publish_distinct(
+        generations, profile_dir, profile, profile_bytes,
+        ["Example Two", "Example Three", "Example Four"], retain=1,
+    )
+
+    kept = sorted(path.name for path in (profile_dir / "generations").iterdir())
+    assert kept == sorted([published[-1], "not-a-generation"])
+    assert (stranger / "note").read_bytes() == b"left alone"
+
+
+def test_retention_below_one_is_refused_before_any_filesystem_work(tmp_path: Path) -> None:
+    generations = _load("generations")
+    profile_dir, profile, profile_bytes = _profile_dir(
+        tmp_path, {"one.vcf": _card("one", "Example One")}
+    )
+
+    with pytest.raises(ValueError):
+        generations.publish(profile_dir, profile, profile_bytes, retain=0)
+
+    assert not (profile_dir / "generations").exists()
+    assert not (profile_dir / "current").exists()

@@ -107,6 +107,15 @@ bytes. It covers the entire source payload, not timestamps, profile display
 name, paths, ETags, runtime versions, or envelope metadata. Equivalent array
 order and line endings yield the same digest; changed contact data does not.
 
+Every published generation is a full copy of the mirror plus its index, so
+publication prunes the oldest generations beyond `RETAINED_GENERATIONS` (3,
+counting the new current one) once the pointer commit is durable. Recency is
+the generation directory's own mtime, fixed at publication by the rename from
+staging. The generation `current` names is never a candidate, whatever its
+age, and entries in `generations/` that are not well-formed generation
+directories are left untouched. A pruning failure is reported like any other
+error; the committed pointer stands regardless.
+
 ## Command envelopes: `carddav-command/1.1`
 
 `carddav-command/1.1` differs from `1.0` in exactly two ways: every read

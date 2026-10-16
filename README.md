@@ -96,6 +96,9 @@ mirror with `vobject`, builds a private SQLite index, and publishes it as an
 immutable generation selected by an atomic `current` pointer that also records
 the successful sync time; unchanged remote content reuses the existing
 generation and only refreshes that time.
+Each publication then keeps only the newest three generations on disk (the
+current one and two predecessors); older ones are removed, so the profile's
+footprint stays at a few copies of the address book rather than one per sync.
 
 `status`, `search`, `show`, `snapshot`, and `audit` (each `--profile NAME
 --json`) answer from that generation with no network, no subprocess, and no

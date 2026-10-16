@@ -2,7 +2,9 @@
 
 The pointer carries both the selected generation and the time that sync
 succeeded, so one atomic commit records both facts (see
-`references/configuration.md`).
+`references/configuration.md`). Publication then prunes the oldest published
+generations beyond `RETAINED_GENERATIONS`; the generation `current` names is
+never a candidate.
 """
 
 from __future__ import annotations
@@ -33,6 +35,11 @@ LEGACY_POINTER_SCHEMA_VERSION = "carddav-current/1.0"
 MANAGED_DIR_MODE = 0o700
 MANAGED_FILE_MODE = 0o600
 GENERATION_ENTRIES = ("index.sqlite3", "manifest.json", "mirror")
+# Generations kept on disk after a publication, counting the current one. Each
+# is a full copy of the mirror plus its index, so an unbounded history grows by
+# one address book per changed sync. Two predecessors are enough to inspect
+# what the last syncs changed; readers only ever consult `current`.
+RETAINED_GENERATIONS = 3
 _GENERATION_RE = re.compile(r"[0-9a-f]{64}\Z")
 _TIMESTAMP_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
 
@@ -267,13 +274,45 @@ def _pointer_timestamp(now: float | None) -> str:
     return datetime.fromtimestamp(seconds, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _prune(generations_dir: Path, current: str, retain: int) -> None:
+    """Remove the oldest published generations beyond `retain`, never `current`.
+
+    Runs only after the pointer commit, so every candidate is unreferenced.
+    Recency is the directory's own mtime: `os.rename` from staging leaves it at
+    the moment the generation's last entry was written, i.e. its publication.
+    Only well-formed generation directories are candidates — anything else in
+    the root is unexpected state this never interprets, repairs, or removes.
+    """
+    candidates: list[tuple[int, str, Path]] = []
+    for child in generations_dir.iterdir():
+        if child.name == current or _GENERATION_RE.fullmatch(child.name) is None:
+            continue
+        info = child.lstat()
+        if not stat.S_ISDIR(info.st_mode):
+            continue
+        candidates.append((info.st_mtime_ns, child.name, child))
+    candidates.sort(reverse=True)
+    excess = candidates[retain - 1:]
+    for _mtime, _name, child in excess:
+        shutil.rmtree(child)
+    if excess:
+        _fsync_directory(generations_dir)
+
+
 def publish(
     profile_dir: Path,
     profile: Mapping[str, object],
     profile_bytes: bytes,
     now: float | None = None,
+    retain: int = RETAINED_GENERATIONS,
 ) -> str:
-    """Index the mirror in private staging, then publish it atomically."""
+    """Index the mirror in private staging, publish it atomically, then prune.
+
+    `retain` is how many generations stay on disk afterwards, the new current
+    one included; it must be at least 1.
+    """
+    if retain < 1:
+        raise ValueError("retain must be at least 1")
     collections = profile["collection_allowlist"]
     if not isinstance(collections, list) or not all(
         isinstance(value, str) for value in collections
@@ -343,6 +382,9 @@ def publish(
             # Nothing referenced this directory yet; a committed pointer is never rolled back.
             shutil.rmtree(published, ignore_errors=True)
         raise
+    # Publication is complete and durable above; pruning is a separate step
+    # whose failure is reported rather than hidden — the pointer stands either way.
+    _prune(generations_dir, generation, retain)
     return generation
 
 
